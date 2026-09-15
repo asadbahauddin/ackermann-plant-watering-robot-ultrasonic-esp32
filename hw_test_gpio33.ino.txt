@@ -1,0 +1,22 @@
+#include "driver/gpio.h"
+
+void setup() {
+  Serial.begin(115200);
+  gpio_pad_select_gpio(GPIO_NUM_33);
+  gpio_set_direction(GPIO_NUM_33, GPIO_MODE_INPUT);
+  pinMode(13, OUTPUT);
+  digitalWrite(13, LOW);
+}
+
+void loop() {
+  digitalWrite(13, LOW);
+  delayMicroseconds(4);
+  digitalWrite(13, HIGH);
+  delayMicroseconds(12);
+  digitalWrite(13, LOW);
+
+  unsigned long dur = pulseIn(33, HIGH, 25000UL);
+  int direct = digitalRead(33);
+  Serial.printf("pulseIn=%lu us | digitalRead=%d\n", dur, direct);
+  delay(200);
+}
