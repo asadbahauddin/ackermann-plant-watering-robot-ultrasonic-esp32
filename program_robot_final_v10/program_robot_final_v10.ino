@@ -768,7 +768,9 @@ function applySensor(m){
 
   $('jPwm').textContent = m.motor_speed;
   $('jSdt').textContent = m.steer_angle;
-  $('jBoost').style.display = (m.mode === 'otomatis' && m.motor_speed !== m.auto_base) ? 'inline' : 'none';
+  const ubah = (m.mode === 'otomatis' && m.motor_speed !== m.auto_base);
+  $('jBoost').style.display = ubah ? 'inline' : 'none';
+  $('jBoost').textContent = (m.motor_speed === 0) ? 'REM' : 'BOOST';
   if(typeof m.joy_pwm === 'number' && document.activeElement !== $('jyP')){
     $('jyP').value = m.joy_pwm; $('jyPv').textContent = pct(m.joy_pwm);
   }
@@ -1069,11 +1071,12 @@ static void steerRecalcTarget() {
   g_tgtAngle = constrain(g_tgtAngle, -g_maxAngle, g_maxAngle);
   g_tgtSteps = (long)g_tgtAngle * (long)g_stepsPerDeg;
 }
-// Polaritas EN DM556. Nilai 0 = polaritas lama yang terbukti bisa CW & CCW.
-// Uji: Steering Enable TIDAK dicentang lalu putar poros stepper dengan tangan. Bila poros tetap
-// terkunci (motor panas), berarti jalur ENA tidak bekerja (DM556 bawaannya AKTIF bila ENA tidak
-// dialiri arus) -> periksa kabel ENA+/ENA- & BC547-nya, bukan ubah nilai ini.
-#define DM556_EN_DIBALIK  0
+// Polaritas EN DM556. Uji putar poros: dengan nilai 0, Enable OFF -> poros terkunci, Enable ON ->
+// poros bebas (terbalik), maka dipakai 1. Benar bila: Enable OFF = poros bebas, ON = terkunci.
+#define DM556_EN_DIBALIK  1
+// Arah putar stepper. Uji: stepper berputar terbalik (CW <-> CCW), maka dipakai 1.
+// Benar bila: stik / sudut ke KANAN -> roda kemudi berbelok ke KANAN.
+#define DM556_DIR_DIBALIK 1
 static void steerApplyEnable() {
   bool aktif = g_steerEn && !g_jedaStepper;
   if (DM556_EN_DIBALIK) aktif = !aktif;
@@ -1092,7 +1095,7 @@ static void steerLoop() {
   g_lastStepUs = now;
 
   bool dirPos = (g_tgtSteps > g_curSteps);
-  drvWrite(PIN_DIR, dirPos ? LOW : HIGH);
+  drvWrite(PIN_DIR, (dirPos != (bool)DM556_DIR_DIBALIK) ? LOW : HIGH);
   delayMicroseconds(50);   // DM556 butuh DIR stabil >= 5 us sebelum STEP; BC547 + opto menambah tunda
   drvStepPulse();
   g_curSteps += dirPos ? 1 : -1;
@@ -1104,6 +1107,7 @@ static void steerLoop() {
 static int pwmDenganBoost(int base) {
   if (g_mode != MODE_OTOMATIS || base == 0) return base;   // robot diputuskan diam -> tetap diam
   int y = g_joyY;
+  if (base > 0 && y < 0) return 0;     // maju + stik ditarik ke bawah -> REM (PWM 0, BTS7960 mengerem)
   if (base > 0 && y > 0) return base + (255 - base) * y / 100;
   if (base < 0 && y < 0) return base - (255 + base) * (-y) / 100;
   return base;
@@ -1449,7 +1453,8 @@ static void autoModeStep(float dt) {
     static float fRef = 999.0f;
     static uint32_t tRef = 0;
     if (runBaru) { fRef = 999.0f; tRef = now; }
-    bool maju = (g_state == JELAJAH || g_state == MELAMBAT || g_state == BELOK_KIRI || g_state == BELOK_KANAN);
+    bool maju = (g_state == JELAJAH || g_state == MELAMBAT || g_state == BELOK_KIRI || g_state == BELOK_KANAN)
+                && g_motorSpeed > 0;   // sedang direm lewat stik -> bukan macet
     if (!maju || front >= g_jarakMundur + 15.0f || fabsf(front - fRef) > 3.0f) { fRef = front; tRef = now; }
     else if (now - tRef > 1500UL) { macet = true; fRef = 999.0f; tRef = now; }
   }

@@ -604,8 +604,8 @@ static void steerRecalcTarget() {
 
 static void steerApplyEnable() {
   // logic HIGH di kaki EN = driver aktif (lihat catatan BC547)
-  // polaritas disamakan dengan program_robot_final_v10 (terbukti bisa CW & CCW)
-  drvWrite(PIN_EN, g_steerEn ? LOW : HIGH);
+  // uji putar poros: polaritas ini benar (Enable OFF = poros bebas, ON = terkunci)
+  drvWrite(PIN_EN, g_steerEn ? HIGH : LOW);
 }
 
 static int steerReportAngle() {
@@ -623,8 +623,8 @@ static void steerLoop() {
   g_lastStepUs = now;
 
   bool dirPos = (g_tgtSteps > g_curSteps);       // true = ke kanan (sudut naik)
-  drvWrite(PIN_DIR, dirPos ? LOW : HIGH);
-  delayMicroseconds(50);                         // settle DIR sebelum step (DM556 >= 5 us + tunda BC547/opto)
+  drvWrite(PIN_DIR, dirPos ? HIGH : LOW);        // dibalik: arah CW/CCW sebelumnya terbalik
+  delayMicroseconds(50);                        // settle DIR sebelum step (DM556 >= 5 us + tunda BC547/opto)
   drvStepPulse();
   g_curSteps += dirPos ? 1 : -1;
 }
