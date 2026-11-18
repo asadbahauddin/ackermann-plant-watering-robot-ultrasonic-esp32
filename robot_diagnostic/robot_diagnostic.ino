@@ -115,6 +115,8 @@ static const IPAddress AP_MASK(255, 255, 255, 0);
 #define PIN_DIR         19   // INVERTING
 #define PIN_EN          22   // INVERTING
 
+#define PIN_RELAY       15   // relay pompa air (active LOW)
+
 // ===========================================================================
 //  SENSOR - definisi
 // ===========================================================================
@@ -198,13 +200,15 @@ static bool g_motorEn    = false;
 static int  g_maxAngle    = 45;        // sudut maksimum (deg) - hasil kalibrasi
 static int  g_stepsPerDeg = 10;        // steps per derajat  - hasil kalibrasi
 static bool g_steerEn     = false;
+static bool g_pumpOn      = false;     // status relay pompa
+
 
 static long g_curSteps    = 0;         // posisi stepper sekarang (steps)
 static long g_tgtSteps    = 0;         // target posisi (steps)
 static int  g_tgtAngle    = 0;         // target sudut (deg)
 
 static uint32_t g_lastStepUs = 0;
-#define STEP_INTERVAL_US  700          // jarak antar step -> kecepatan putar
+#define STEP_INTERVAL_US  2000         // jarak antar step -> kecepatan putar (2000 us = 500 step/s, aman untuk start tanpa ramp)
 
 // ---- helper level INVERTING untuk DM556 ----
 // logic = level yang DIINGINKAN di kaki driver.
@@ -215,9 +219,9 @@ static inline void drvWrite(uint8_t gpio, uint8_t logic) {
 // satu pulsa STEP (driver: LOW -> HIGH -> LOW). delayMicroseconds diizinkan di sini.
 static inline void drvStepPulse() {
   drvWrite(PIN_STEP, HIGH);
-  delayMicroseconds(6);
+  delayMicroseconds(30);   // lewat BC547 + opto DM556 butuh pulsa lebih lebar dari 6 us
   drvWrite(PIN_STEP, LOW);
-  delayMicroseconds(4);
+  delayMicroseconds(30);
 }
 
 // ===========================================================================
@@ -284,12 +288,17 @@ input[type=number]{background:var(--panel2);color:var(--tx);border:1px solid var
 .proc ol{margin-left:16px}
 .proc li{margin:3px 0}
 .muted{color:var(--tx2);font-size:12px}
+.val-display{font-size:22px;font-weight:700;text-align:center;padding:14px 0}
+.btn-row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.btn-success{background:var(--ok);border-color:var(--ok);color:#fff}
+.btn-danger{background:var(--danger);border-color:var(--danger);color:#fff}
 </style></head><body>
 
 <header>
   <h1>🌱 Robot Diagnostic</h1>
   <div class="badge"><span id="dot" class="dot"></span><span id="wsTxt">Terputus</span></div>
 </header>
+
 
 <div class="card">
   <h2>Sensor Jarak (realtime)</h2>
@@ -312,6 +321,15 @@ input[type=number]{background:var(--panel2);color:var(--tx);border:1px solid var
   </div>
   <div class="row">
     <label class="chk"><input type="checkbox" id="mEn"> Motor Enable (R_EN / L_EN)</label>
+  </div>
+</div>
+
+<div class="card">
+  <h2>💧 Pompa Air</h2>
+  <div class="val-display" id="pumpDisplay">MATI</div>
+  <div class="btn-row">
+    <button class="btn-success" id="pumpOn">💧 ON</button>
+    <button class="btn-danger" id="pumpOff">⛔ OFF</button>
   </div>
 </div>
 
@@ -446,6 +464,12 @@ function applySensor(m){
   $('sEn').checked = !!m.steer_en;
   if(!$('calMax').value) $('calMax').placeholder = m.max_angle + '°';
   if(!$('calSpd').value) $('calSpd').placeholder = m.steps_per_deg + ' steps/°';
+
+  if(typeof m.pump !== 'undefined'){
+    const pd = $('pumpDisplay');
+    pd.textContent = m.pump ? 'HIDUP 💧' : 'MATI';
+    pd.style.color = m.pump ? '#22c55e' : '#ef4444';
+  }
 }
 
 /* ---- Motor slider (debounce 50 ms) ---- */
@@ -467,6 +491,10 @@ $('mStop').addEventListener('click', ()=>{
   send({cmd:'motor_stop'});
 });
 $('mEn').addEventListener('change', e=> send({cmd:'motor_enable', value:e.target.checked}));
+
+/* ---- Pompa air ---- */
+$('pumpOn').addEventListener('click', ()=> send({cmd:'pump', value:true}));
+$('pumpOff').addEventListener('click', ()=> send({cmd:'pump', value:false}));
 
 /* ---- Steering slider (debounce 50 ms) ---- */
 let sTimer = null;
@@ -576,6 +604,7 @@ static void steerRecalcTarget() {
 
 static void steerApplyEnable() {
   // logic HIGH di kaki EN = driver aktif (lihat catatan BC547)
+  // polaritas disamakan dengan program_robot_final_v10 (terbukti bisa CW & CCW)
   drvWrite(PIN_EN, g_steerEn ? LOW : HIGH);
 }
 
@@ -595,7 +624,7 @@ static void steerLoop() {
 
   bool dirPos = (g_tgtSteps > g_curSteps);       // true = ke kanan (sudut naik)
   drvWrite(PIN_DIR, dirPos ? LOW : HIGH);
-  delayMicroseconds(3);                          // settle DIR sebelum step
+  delayMicroseconds(50);                         // settle DIR sebelum step (DM556 >= 5 us + tunda BC547/opto)
   drvStepPulse();
   g_curSteps += dirPos ? 1 : -1;
 }
@@ -617,6 +646,7 @@ static void broadcastSensors() {
   doc["steps_per_deg"] = g_stepsPerDeg;
   doc["motor_en"]      = g_motorEn;
   doc["steer_en"]      = g_steerEn;
+  doc["pump"]          = g_pumpOn;
 
   String out;
   serializeJson(doc, out);
@@ -672,6 +702,10 @@ static void handleCommand(const uint8_t *data, size_t len) {
 
   } else if (!strcmp(cmd, "read_sensors")) {
     g_forceSend = true;
+
+  } else if (!strcmp(cmd, "pump")) {
+    g_pumpOn = doc["value"] | false;
+    digitalWrite(PIN_RELAY, g_pumpOn ? LOW : HIGH);
   }
 }
 
@@ -728,6 +762,11 @@ void setup() {
   pinMode(PIN_EN,   OUTPUT);
   drvWrite(PIN_STEP, LOW);     // idle
   drvWrite(PIN_DIR,  LOW);
+
+  // ---- Relay pompa ----
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, HIGH); // relay OFF saat boot (active LOW)
+
   steerApplyEnable();          // g_steerEn = false -> driver disabled
 
   // ---- Access Point ----
