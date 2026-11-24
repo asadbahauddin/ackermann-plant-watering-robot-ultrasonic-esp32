@@ -88,6 +88,40 @@ Cari berdasarkan nama fungsi atau variabel, karena nomor baris bisa bergeser:
   belokan atau dinding di ujung. Buat beberapa skenario: lurus, posisi awal tidak di tengah,
   belokan, dan rintangan di depan.
 
+## Model motor DC dan pengereman
+
+User meminta "DC injection braking". Teknik itu sebenarnya untuk motor AC induksi, sedangkan
+motor penggerak robot adalah **motor DC sikat lewat driver BTS7960**. Karena itu yang
+disimulasikan adalah padanannya untuk motor DC. Di laporan, sebut sebagai pengereman dinamis
+(padanan DC injection braking pada motor DC).
+
+- **Model motor DC** (ganti pemetaan PWM → kecepatan yang sederhana):
+  - Listrik: V = R·i + L·di/dt + Ke·ω, dengan V = (PWM/255)·V_baterai.
+  - Mekanik: J·dω/dt = Kt·i − b·ω − τ_beban.
+  - τ_beban berasal dari massa robot, jari-jari roda, rasio gearbox, gesekan gelinding, dan
+    tanjakan.
+  - Semua parameter ada di `config_robot.m`. Tanyakan spesifikasi motor dan baterai ke user,
+    dan sementara pakai nilai wajar untuk motor gearbox 12 V.
+- **Tiga mode pengereman**, bisa dipilih:
+  1. **Meluncur (coast)**: R_EN/L_EN LOW, sehingga arus motor ≈ 0 dan robot berhenti hanya
+     karena gesekan.
+  2. **Dynamic braking / REM**: kedua kaki motor dihubung-singkat lewat sisi bawah BTS7960
+     (V = 0), sehingga back-EMF menghasilkan arus pengereman i = −Ke·ω/R. **Ini yang terjadi
+     di robot asli** saat PWM 0 dengan enable ON, misalnya fitur REM lewat stik di mode
+     otomatis atau keadaan BERHENTI/LIHAT.
+  3. **Plugging**: tegangan dibalik (PWM negatif sesaat). Pengereman paling cepat, tetapi
+     arusnya besar.
+- **Output**:
+  - grafik kecepatan, arus motor, dan jarak tempuh terhadap waktu untuk ketiga mode, dari
+    kecepatan JELAJAH (PWM 110) dan dari kecepatan maksimum
+  - tabel jarak berhenti, waktu berhenti, dan arus puncak
+  - tandai bila arus puncak melewati batas proteksi BTS7960 (~43 A), karena proteksi itu
+    mengunci driver
+- **Dalam simulasi navigasi**: setiap kali mesin keadaan memberi PWM 0 (BERHENTI, LIHAT, jeda
+  MUNDUR), gunakan mode dynamic braking supaya jarak berhenti robot realistis terhadap
+  ambang `g_jarakMundur`. Uji juga skenario tanjakan: pada PWM 70% robot melambat atau
+  berhenti, lalu fitur BOOST lewat stik dimodelkan sebagai kenaikan PWM sementara.
+
 ## Output yang diharapkan
 
 1. **Animasi** robot bergerak di lorong: badan robot, roda kemudi, garis sinar sensor, tanaman
@@ -116,6 +150,7 @@ simulasi_matlab/
   pid_diskrit.m          % salinan persis hitungPID()
   kendali_otomatis.m     % salinan autoModeStep() (mesin keadaan + filter)
   model_ackermann.m
+  model_motor_dc.m       % motor DC + mode pengereman (coast / dynamic braking / plugging)
   sensor_ultrasonik.m
   lintasan_*.m           % skenario
   animasi.m, plot_hasil.m, ekspor_log.m, bandingkan_log.m
