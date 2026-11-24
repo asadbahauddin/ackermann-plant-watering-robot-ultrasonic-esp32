@@ -223,6 +223,24 @@ static volatile uint32_t g_joyLastMs = 0;
 static volatile bool     g_joyBaru = false;
 #define JOY_TIMEOUT_MS  600            // tak ada pesan stik > ini (WiFi putus) -> dianggap dilepas
 static int  g_autoBase = 0;            // PWM keputusan mode OTOMATIS sebelum ditambah stik
+
+// ---- MODE PENGEREMAN (dipilih dari web, berlaku di MANUAL & OTOMATIS) ----
+// Dipakai setiap perintah motor menjadi 0 (stik dilepas, REM lewat stik, BERHENTI, LIHAT, ...).
+//  MELUNCUR : R_EN/L_EN LOW -> semua transistor BTS7960 mati, robot berhenti karena gesekan.
+//  DINAMIS  : R_EN/L_EN HIGH + PWM 0 -> kaki motor dihubung-singkat, back-EMF mengerem
+//             (padanan "DC injection braking" pada motor DC). Perilaku bawaan sejak dulu.
+//  PLUGGING : tegangan dibalik sesaat (PWM berlawanan, maks 50%) selama g_remMs, lalu DINAMIS.
+//             Paling cepat berhenti, tetapi arusnya besar. Bila terlalu lama, robot ikut mundur.
+enum { REM_MELUNCUR = 0, REM_DINAMIS = 1, REM_PLUGGING = 2 };
+static int  g_remMode = REM_DINAMIS;
+static int  g_remPwm  = 80;            // PWM balik saat plugging (0..127 = maks 50%)
+static int  g_remMs   = 250;           // lama plugging (ms)
+#define REM_PWM_MAKS  127
+static int      g_motorOut   = 0;      // keluaran yang benar-benar dikirim ke BTS7960
+static bool     g_plugAktif  = false;
+static uint32_t g_plugMulai  = 0;
+static int      g_plugArah   = 0;
+static void motorKeluar(int out, bool enHigh);
 // Jeda motor saat JSN depan mengukur (anti-derau). Uji: motor berputar membuat sensor depan
 // membaca ~50-56 cm semu walau 5 V stabil. Selama pengukuran depan (3-25 ms per siklus sensor)
 // driver BTS7960 dimatikan (R_EN/L_EN LOW -> motor meluncur bebas, tidak mengerem), lalu
@@ -579,6 +597,22 @@ select{background:var(--panel2);color:var(--tx);border:1px solid var(--line);bor
 </div>
 
 <div class="card">
+  <h2>Mode Rem</h2>
+  <div class="row btns">
+    <button class="mode" id="rem0" onclick="setRem(0)">MELUNCUR</button>
+    <button class="mode" id="rem1" onclick="setRem(1)">DINAMIS</button>
+    <button class="mode" id="rem2" onclick="setRem(2)">PLUGGING</button>
+  </div>
+  <div class="row btns" id="remPlug">
+    <span class="lbl2">PWM balik</span>
+    <input type="number" id="remPwm" min="0" max="127" step="1"><span class="readout" id="remPct">-</span>
+    <span class="lbl2">Lama (ms)</span>
+    <input type="number" id="remMs" min="50" max="1500" step="10">
+    <button id="remSet" class="primary">Simpan</button>
+  </div>
+</div>
+
+<div class="card">
   <h2>Sensor Jarak</h2>
   <div class="sensors" id="sensors"></div>
   <div class="row" style="margin-top:10px">
@@ -777,6 +811,12 @@ function applySensor(m){
   if(typeof m.joy_sudut === 'number' && document.activeElement !== $('jyS')){
     $('jyS').value = m.joy_sudut; $('jySv').innerHTML = m.joy_sudut + '&deg;';
   }
+  if(typeof m.rem_mode === 'number'){
+    [0,1,2].forEach(i=> $('rem'+i).className = 'mode' + (m.rem_mode === i ? ' aktif' : ''));
+    $('remPlug').style.display = (m.rem_mode === 2) ? '' : 'none';
+    if(document.activeElement !== $('remPwm')){ $('remPwm').value = m.rem_pwm; $('remPct').textContent = pct(m.rem_pwm); }
+    if(document.activeElement !== $('remMs'))  $('remMs').value = m.rem_ms;
+  }
 
   $('tSpeed').textContent = m.motor_speed;
   if(m.up !== undefined){
@@ -865,6 +905,13 @@ $('jyP').addEventListener('change', joyCfg);
 $('jyS').addEventListener('change', joyCfg);
 
 $('mEn').addEventListener('change', e=> send({cmd:'motor_enable', value:e.target.checked}));
+
+/* ---- Mode rem ---- */
+function setRem(m){ send({cmd:'set_rem', mode:m}); }
+$('remPwm').addEventListener('input', e=>{ $('remPct').textContent = pct(Math.min(127, +e.target.value)); });
+$('remSet').addEventListener('click', ()=>{
+  send({cmd:'set_rem', pwm: parseInt($('remPwm').value, 10), ms: parseInt($('remMs').value, 10)});
+});
 $('sEn').addEventListener('change', e=> send({cmd:'steer_enable', value:e.target.checked}));
 
 /* ---- Kalibrasi ---- */
@@ -1032,35 +1079,66 @@ static void motorApply() {
     pwmWrite(PIN_LPWM, MOTOR_CH_LPWM, 0);
     return;
   }
+  if (!g_motorEn) {                    // Motor Enable OFF (darurat): driver mati, motor bebas
+    g_plugAktif = false;
+    motorKeluar(0, false);
+    return;
+  }
+  if (g_motorSpeed != 0) {             // perintah jalan biasa -> batalkan pengereman
+    g_plugAktif = false;
+    motorKeluar(g_motorSpeed, true);
+    return;
+  }
+  // ---- perintah 0: REM sesuai mode yang dipilih di web ----
+  if (g_remMode == REM_PLUGGING) {
+    if (!g_plugAktif && g_motorOut != 0) {        // baru saja berhenti dari bergerak
+      g_plugAktif = true;
+      g_plugMulai = millis();
+      g_plugArah  = (g_motorOut > 0) ? -1 : 1;    // dorong berlawanan dengan arah gerak
+    }
+    if (g_plugAktif && millis() - g_plugMulai < (uint32_t)g_remMs) {
+      motorKeluar(g_plugArah * g_remPwm, true);
+      return;
+    }
+    g_plugAktif = false;                          // waktu habis -> tahan dengan rem dinamis
+  }
+  motorKeluar(0, g_remMode != REM_MELUNCUR);      // MELUNCUR: EN LOW; DINAMIS: EN HIGH + PWM 0
+}
+
+// dipanggil dari loop(): mengakhiri plugging tepat waktu walau tidak ada perintah baru
+static void motorTick() {
+  if (g_plugAktif && millis() - g_plugMulai >= (uint32_t)g_remMs) motorApply();
+}
+
+// Tulis keluaran ke BTS7960. out = -255..255 (0 = tidak ada daya), enHigh = R_EN/L_EN.
+// out = 0 + enHigh -> kedua sisi bawah BTS7960 menyala = kaki motor dihubung-singkat = REM DINAMIS.
+// out = 0 + !enHigh -> semua transistor mati = motor MELUNCUR bebas.
+static void motorKeluar(int out, bool enHigh) {
   // Reset pengaman BTS7960: bila arus berlebih / panas (motor tertahan saat belok), driver
   // mengunci keluarannya sampai R_EN/L_EN di-LOW-kan. Uji: robot macet tak bisa maju/mundur,
   // pulih setelah Motor Enable dimatikan-dinyalakan. Maka setiap motor MULAI berputar (dari 0
-  // atau ganti arah) enable di-LOW-kan 2 ms dulu agar kunci pengaman terlepas.
-  static int lastSpeed = 0;
-  int sekarang = g_motorEn ? g_motorSpeed : 0;
-  if (sekarang != 0 && (lastSpeed == 0 || (lastSpeed > 0) != (sekarang > 0))) {
+  // atau ganti arah, termasuk saat plugging) enable di-LOW-kan 2 ms dulu agar kunci terlepas.
+  if (out != 0 && (g_motorOut == 0 || (g_motorOut > 0) != (out > 0))) {
     pwmWrite(PIN_RPWM, MOTOR_CH_RPWM, 0);
     pwmWrite(PIN_LPWM, MOTOR_CH_LPWM, 0);
     digitalWrite(PIN_R_EN, LOW);
     digitalWrite(PIN_L_EN, LOW);
     delay(2);
   }
-  lastSpeed = sekarang;
+  g_motorOut = out;
 
-  digitalWrite(PIN_R_EN, g_motorEn ? HIGH : LOW);
-  digitalWrite(PIN_L_EN, g_motorEn ? HIGH : LOW);
+  digitalWrite(PIN_R_EN, enHigh ? HIGH : LOW);
+  digitalWrite(PIN_L_EN, enHigh ? HIGH : LOW);
 
-  if (!g_motorEn || g_motorSpeed == 0) {
+  if (out > 0) {
     pwmWrite(PIN_RPWM, MOTOR_CH_RPWM, 0);
+    pwmWrite(PIN_LPWM, MOTOR_CH_LPWM, out);
+  } else if (out < 0) {
     pwmWrite(PIN_LPWM, MOTOR_CH_LPWM, 0);
-    return;
-  }
-  if (g_motorSpeed > 0) {
-    pwmWrite(PIN_RPWM, MOTOR_CH_RPWM, 0);
-    pwmWrite(PIN_LPWM, MOTOR_CH_LPWM, g_motorSpeed);
+    pwmWrite(PIN_RPWM, MOTOR_CH_RPWM, -out);
   } else {
+    pwmWrite(PIN_RPWM, MOTOR_CH_RPWM, 0);
     pwmWrite(PIN_LPWM, MOTOR_CH_LPWM, 0);
-    pwmWrite(PIN_RPWM, MOTOR_CH_RPWM, -g_motorSpeed);
   }
 }
 
@@ -1743,6 +1821,7 @@ static void broadcastSensors() {
   doc["i_f"] = IDX_FRONT; doc["i_l"] = IDX_LEFT; doc["i_r"] = IDX_RIGHT; doc["i_w"] = IDX_WATER;
   doc["i_sl"] = IDX_SLEFT; doc["i_sr"] = IDX_SRIGHT;
   doc["joy_pwm"] = g_joyPwm; doc["joy_sudut"] = g_joySudut; doc["auto_base"] = g_autoBase;
+  doc["rem_mode"] = g_remMode; doc["rem_pwm"] = g_remPwm; doc["rem_ms"] = g_remMs;
 
   String out;
   serializeJson(doc, out);
@@ -1773,6 +1852,7 @@ static void simpanSetelan() {
   g_prefs.putBool("fz", g_useFuzzy);
   g_prefs.putInt("mxA", g_maxAngle); g_prefs.putInt("spd", g_stepsPerDeg);
   g_prefs.putInt("jyP", g_joyPwm);   g_prefs.putInt("jyS", g_joySudut);
+  g_prefs.putInt("rM", g_remMode);   g_prefs.putInt("rP", g_remPwm);   g_prefs.putInt("rT", g_remMs);
   g_prefs.putInt("ver", SETELAN_VERSI);
   g_prefs.end();
 }
@@ -1786,6 +1866,9 @@ static void muatSetelan() {
   g_maxAngle = g_prefs.getInt("mxA", g_maxAngle); g_stepsPerDeg = g_prefs.getInt("spd", g_stepsPerDeg);
   g_steerSign = g_prefs.getFloat("sg", g_steerSign);
   g_joyPwm   = g_prefs.getInt("jyP", g_joyPwm);  g_joySudut = g_prefs.getInt("jyS", g_joySudut);
+  g_remMode  = constrain(g_prefs.getInt("rM", g_remMode), 0, 2);
+  g_remPwm   = constrain(g_prefs.getInt("rP", g_remPwm), 0, REM_PWM_MAKS);
+  g_remMs    = constrain(g_prefs.getInt("rT", g_remMs), 50, 1500);
   if (versiLama) {   // setelan dari program lama: hanya pemetaan sensor & kalibrasi kemudi yang dipakai
     g_prefs.end();
     simpanSetelan();   // tulis ulang dengan nilai bawaan baru + nomor versi
@@ -1925,6 +2008,13 @@ static void handleCommand(const uint8_t *data, size_t len) {
     g_joyY = constrain((int)(doc["y"] | 0), -100, 100);
     g_joyLastMs = millis();
     g_joyBaru = true;
+
+  } else if (!strcmp(cmd, "set_rem")) {
+    g_remMode = constrain((int)(doc["mode"] | g_remMode), 0, 2);
+    g_remPwm  = constrain((int)(doc["pwm"]  | g_remPwm), 0, REM_PWM_MAKS);   // maks 50%
+    g_remMs   = constrain((int)(doc["ms"]   | g_remMs), 50, 1500);
+    simpanSetelan();
+    g_forceSend = true;
 
   } else if (!strcmp(cmd, "joy_cfg")) {
     g_joyPwm   = constrain((int)(doc["pwm"] | g_joyPwm), 0, 255);
@@ -2087,6 +2177,8 @@ void loop() {
       manualLogStep();                 // rekam data saat robot dikemudikan manual
     }
   }
+
+  motorTick();                         // akhiri plugging tepat waktu
 
   // ---- Joystick web ----
   if ((g_joyX != 0 || g_joyY != 0) && now - g_joyLastMs > JOY_TIMEOUT_MS) {
